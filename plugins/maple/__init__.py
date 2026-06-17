@@ -15,10 +15,11 @@ import os
 import re
 import shlex
 import subprocess
+from datetime import datetime, timezone
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from tools.registry import tool_error, tool_result
 
@@ -32,6 +33,11 @@ DEFAULT_TIMEOUT = float(os.environ.get("MAPLE_TIMEOUT", "300"))
 HIGH_RISK_RE = re.compile(
     r"(?i)\b(seed phrase|mnemonic|private key|xprv|zprv|yprv|wallet seed|signing key|api[_ -]?key|bearer\s+[A-Za-z0-9._-]{12,})\b"
 )
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+MAPLE_STATE_DIR = HERMES_HOME / "maple"
+MAPLE_THREAD_STORE = Path(os.environ.get("MAPLE_THREAD_STORE", str(MAPLE_STATE_DIR / "active-sessions.json"))).expanduser()
+SESSION_ID_RE = re.compile(r"^session_id:\s*(\S+)\s*$", re.MULTILINE)
+RESUME_LINE_RE = re.compile(r"^↻ Resumed session .*$", re.MULTILINE)
 
 
 class MaplePluginError(RuntimeError):
@@ -341,7 +347,12 @@ def _maple_slash(raw_args: str) -> str:
             "/maple models\n"
             "/maple chat <non-sensitive prompt>\n"
             "/maple file <path> --prompt <instruction> [--output <path>]\n"
-            "/maple agent <path-or-prompt>  (requires maple-private profile)"
+            "/maple agent <path-or-prompt>  (one-shot maple-private profile)\n"
+            "/maple thread start [--name NAME] <task>\n"
+            "/maple thread ask [--name NAME] <follow-up>\n"
+            "/maple thread status [--name NAME]\n"
+            "/maple thread end [--name NAME]\n"
+            "Aliases: /maple start, /maple ask, /maple end"
         )
     sub, _, rest = raw.partition(" ")
     sub = sub.lower()
@@ -366,34 +377,224 @@ def _maple_slash(raw_args: str) -> str:
             return f"Maple file failed: {e}"
     if sub == "agent":
         return _run_maple_agent(rest.strip())
+    if sub == "thread":
+        return _maple_thread_slash(rest.strip())
+    if sub == "start":
+        return _thread_start(rest.strip())
+    if sub == "ask":
+        return _thread_ask(rest.strip())
+    if sub == "end":
+        return _thread_end(rest.strip())
     return f"Unknown /maple subcommand: {sub}\nTry /maple help"
 
 
 def _run_maple_agent(raw: str) -> str:
     if not raw:
         return "Usage: /maple agent <path-or-prompt>"
-    wrapper = Path.home() / ".local/bin/maple-agent"
-    if not wrapper.exists():
-        return "maple-agent wrapper is not installed yet."
     try:
         argv = shlex.split(raw)
     except ValueError as e:
         return f"maple-agent args parse failed: {e}"
     if not argv:
         return "Usage: /maple agent <path-or-prompt>"
+    rc, output = _run_maple_agent_argv(argv)
+    if rc != 0:
+        return f"maple-agent failed ({rc}):\n{output[-2000:]}"
+    return _clean_agent_output(output) or "maple-agent completed with no output."
+
+
+def _maple_agent_wrapper() -> Path:
+    wrapper = Path.home() / ".local/bin/maple-agent"
+    if not wrapper.exists():
+        raise MaplePluginError("maple-agent wrapper is not installed yet.")
+    return wrapper
+
+
+def _run_maple_agent_argv(argv: List[str], timeout: int = 600) -> Tuple[int, str]:
+    wrapper = _maple_agent_wrapper()
     try:
         proc = subprocess.run(
             [str(wrapper), *argv],
             text=True,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=600,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
         )
-    except subprocess.TimeoutExpired:
-        return "maple-agent timed out after 10 minutes."
-    if proc.returncode != 0:
-        return f"maple-agent failed ({proc.returncode}):\n{proc.stderr[-2000:] or proc.stdout[-2000:]}"
-    return proc.stdout.strip() or "maple-agent completed with no output."
+    except subprocess.TimeoutExpired as e:
+        partial = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        return 124, (partial + "\nmaple-agent timed out after 10 minutes.").strip()
+    return proc.returncode, proc.stdout or ""
+
+
+def _clean_agent_output(output: str) -> str:
+    text = SESSION_ID_RE.sub("", output or "")
+    text = RESUME_LINE_RE.sub("", text)
+    return "\n".join(line for line in text.splitlines() if line.strip()).strip()
+
+
+def _extract_session_id(output: str) -> str:
+    matches = SESSION_ID_RE.findall(output or "")
+    return matches[-1] if matches else ""
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _thread_store_load() -> Dict[str, Dict[str, Any]]:
+    try:
+        if not MAPLE_THREAD_STORE.exists():
+            return {}
+        data = json.loads(MAPLE_THREAD_STORE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _thread_store_save(data: Dict[str, Dict[str, Any]]) -> None:
+    MAPLE_THREAD_STORE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = MAPLE_THREAD_STORE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(MAPLE_THREAD_STORE)
+    try:
+        MAPLE_THREAD_STORE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def _normalize_thread_name(name: str) -> str:
+    name = (name or "default").strip()
+    name = re.sub(r"[^A-Za-z0-9_.-]+", "-", name).strip("-._")
+    return name[:80] or "default"
+
+
+def _extract_name(raw: str) -> Tuple[str, str]:
+    """Parse optional --name/-n from the start of raw args."""
+    try:
+        parts = shlex.split(raw or "")
+    except ValueError:
+        return "default", raw.strip()
+    if len(parts) >= 2 and parts[0] in {"--name", "-n"}:
+        name = _normalize_thread_name(parts[1])
+        rest = " ".join(shlex.quote(x) for x in parts[2:])
+        return name, rest
+    return "default", (raw or "").strip()
+
+
+def _task_argv(raw_task: str) -> List[str]:
+    raw_task = (raw_task or "").strip()
+    if not raw_task:
+        return []
+    # Preserve normal free-form prompts as one argument. Let advanced users pass
+    # wrapper flags by starting with a flag, e.g. --file path --prompt ...
+    if raw_task.startswith("-"):
+        try:
+            return shlex.split(raw_task)
+        except ValueError:
+            return [raw_task]
+    return [raw_task]
+
+
+def _thread_start(raw: str) -> str:
+    name, task = _extract_name(raw)
+    if not task:
+        return "Usage: /maple thread start [--name NAME] <task-or-file>"
+    rc, output = _run_maple_agent_argv(_task_argv(task))
+    clean = _clean_agent_output(output)
+    if rc != 0:
+        return f"Maple thread start failed ({rc}):\n{output[-2000:]}"
+    session_id = _extract_session_id(output)
+    if not session_id:
+        return "Maple thread start failed: no session_id returned.\n" + clean[-2000:]
+    store = _thread_store_load()
+    now = _now_iso()
+    store[name] = {
+        "session_id": session_id,
+        "created_at": now,
+        "updated_at": now,
+        "last_prompt": task[:500],
+    }
+    _thread_store_save(store)
+    return f"Started Maple thread `{name}` ({session_id}).\n\n{clean}".strip()
+
+
+def _thread_ask(raw: str) -> str:
+    name, prompt = _extract_name(raw)
+    if not prompt:
+        return "Usage: /maple thread ask [--name NAME] <follow-up>"
+    store = _thread_store_load()
+    entry = store.get(name)
+    if not entry:
+        return f"No active Maple thread `{name}`. Start one with: /maple thread start [--name {name}] <task>"
+    session_id = str(entry.get("session_id") or "")
+    if not session_id:
+        return f"Maple thread `{name}` is missing a session_id. End it and start a new one."
+    rc, output = _run_maple_agent_argv(["--resume", session_id, prompt])
+    clean = _clean_agent_output(output)
+    if rc != 0:
+        return f"Maple thread ask failed ({rc}):\n{output[-2000:]}"
+    new_session_id = _extract_session_id(output) or session_id
+    entry.update({"session_id": new_session_id, "updated_at": _now_iso(), "last_prompt": prompt[:500]})
+    store[name] = entry
+    _thread_store_save(store)
+    return clean or "(empty Maple thread response)"
+
+
+def _thread_status(raw: str = "") -> str:
+    name, _ = _extract_name(raw)
+    store = _thread_store_load()
+    if not store:
+        return "No active Maple threads. Start one with: /maple thread start <task>"
+    if name != "default" or raw.strip().startswith(("--name", "-n")):
+        entry = store.get(name)
+        if not entry:
+            return f"No active Maple thread `{name}`."
+        return (
+            f"Maple thread `{name}`\n"
+            f"session_id: {entry.get('session_id')}\n"
+            f"created_at: {entry.get('created_at')}\n"
+            f"updated_at: {entry.get('updated_at')}\n"
+            f"last_prompt: {entry.get('last_prompt', '')[:180]}"
+        )
+    lines = ["Active Maple threads:"]
+    for key, entry in sorted(store.items()):
+        lines.append(f"- {key}: {entry.get('session_id')} updated={entry.get('updated_at')}")
+    return "\n".join(lines)
+
+
+def _thread_end(raw: str = "") -> str:
+    name, _ = _extract_name(raw)
+    store = _thread_store_load()
+    if name not in store:
+        return f"No active Maple thread `{name}`."
+    sid = store[name].get("session_id")
+    del store[name]
+    _thread_store_save(store)
+    return f"Ended Maple thread `{name}` ({sid})."
+
+
+def _maple_thread_slash(raw: str) -> str:
+    raw = (raw or "").strip()
+    if not raw or raw in {"help", "--help", "-h"}:
+        return (
+            "Maple thread commands:\n"
+            "/maple thread start [--name NAME] <task-or-file>\n"
+            "/maple thread ask [--name NAME] <follow-up>\n"
+            "/maple thread status [--name NAME]\n"
+            "/maple thread end [--name NAME]\n"
+            "Short aliases: /maple start, /maple ask, /maple end"
+        )
+    sub, _, rest = raw.partition(" ")
+    sub = sub.lower()
+    if sub in {"start", "new", "begin"}:
+        return _thread_start(rest.strip())
+    if sub in {"ask", "send", "continue", "reply"}:
+        return _thread_ask(rest.strip())
+    if sub in {"status", "list", "ls"}:
+        return _thread_status(rest.strip())
+    if sub in {"end", "stop", "close", "clear"}:
+        return _thread_end(rest.strip())
+    return f"Unknown /maple thread subcommand: {sub}\nTry /maple thread help"
 
 
 def register(ctx) -> None:
@@ -401,12 +602,16 @@ def register(ctx) -> None:
     ctx.register_tool("maple_models", "maple", MAPLE_MODELS_SCHEMA, _handle_maple_models, check_fn=lambda: True, emoji="🍁")
     ctx.register_tool("maple_chat", "maple", MAPLE_CHAT_SCHEMA, _handle_maple_chat, check_fn=lambda: True, emoji="🍁")
     ctx.register_tool("maple_file", "maple", MAPLE_FILE_SCHEMA, _handle_maple_file, check_fn=lambda: True, emoji="🍁")
-    ctx.register_command("maple", _maple_slash, description="Maple Proxy status, models, chat, file, and agent commands.", args_hint="status|models|chat|file|agent ...")
+    ctx.register_command("maple", _maple_slash, description="Maple Proxy status, models, chat, file, agent, and stateful thread commands.", args_hint="status|models|chat|file|agent|thread ...")
     ctx.register_command("maple-status", lambda raw: _format_status(), description="Check Maple Proxy health.")
     ctx.register_command("maple-models", lambda raw: _format_models(), description="List Maple models.")
     ctx.register_command("maple-chat", lambda raw: _json_or_text(_handle_maple_chat, {"prompt": raw.strip()}), description="Run a non-sensitive prompt through Maple/Kimi.", args_hint="<prompt>")
     ctx.register_command("maple-file", lambda raw: _json_or_text(_handle_maple_file, _split_file_args(raw)), description="Run a local file through Maple/Kimi.", args_hint="<path> --prompt <instruction>")
     ctx.register_command("maple-agent", lambda raw: _run_maple_agent(raw.strip()), description="Spawn the maple-private Hermes profile via maple-agent.", args_hint="<path-or-prompt>")
+    ctx.register_command("maple-thread", lambda raw: _maple_thread_slash(raw.strip()), description="Manage a resumable Maple-backed Hermes thread.", args_hint="start|ask|status|end ...")
+    ctx.register_command("maple-start", lambda raw: _thread_start(raw.strip()), description="Start the default resumable Maple thread.", args_hint="<task>")
+    ctx.register_command("maple-ask", lambda raw: _thread_ask(raw.strip()), description="Ask a follow-up in the default Maple thread.", args_hint="<follow-up>")
+    ctx.register_command("maple-end", lambda raw: _thread_end(raw.strip()), description="End the default Maple thread.")
 
 
 MAPLE_HEALTH_SCHEMA = {

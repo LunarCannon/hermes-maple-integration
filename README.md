@@ -2,13 +2,14 @@
 
 A lightweight way to use [Maple Proxy](https://github.com/OpenSecretCloud/maple-proxy) from [Hermes Agent](https://hermes-agent.nousresearch.com/) **without making Maple your global/default Hermes model**.
 
-This repo gives you three lanes:
+This repo gives you four lanes:
 
 | Lane | Command | Who is the LLM? | Separate Hermes profile? | Best for |
 |---|---|---:|---:|---|
 | Plugin slash command | `/maple chat ...` | Maple | No | quick non-sensitive Maple replies |
 | Plugin file command | `/maple file /path --prompt ...` | Maple | No | local-file workflows where chat should only contain a path/instruction |
 | Profile-backed agent | `/maple agent ...` or `maple-agent ...` | Maple | Yes | using Maple as the actual Hermes agent brain for one task |
+| Resumable Maple thread | `/maple thread start ...` then `/maple thread ask ...` | Maple | Yes | multi-step Maple conversations without changing your default profile |
 
 The main Hermes profile remains whatever you already use. Maple is available on demand.
 
@@ -30,6 +31,10 @@ The plugin registers:
 /maple chat <prompt>
 /maple file <path> --prompt <instruction> [--output <path>]
 /maple agent <path-or-prompt>
+/maple thread start [--name NAME] <task-or-file>
+/maple thread ask [--name NAME] <follow-up>
+/maple thread status [--name NAME]
+/maple thread end [--name NAME]
 
 /maple-status
 /maple-models
@@ -174,13 +179,57 @@ hermes --profile maple-private chat -q ... -Q --toolsets file,terminal
 
 It does **not** switch your current/default Hermes profile. It is a one-shot subprocess.
 
+### Resumable Maple thread
+
+Use this when you want multi-step follow-up while keeping Maple as the LLM/backend for the thread:
+
+```text
+/maple thread start [--name NAME] <task-or-file>
+/maple thread ask [--name NAME] <follow-up>
+/maple thread status [--name NAME]
+/maple thread end [--name NAME]
+```
+
+Short aliases for the default thread:
+
+```text
+/maple start <task>
+/maple ask <follow-up>
+/maple end
+
+/maple-start <task>
+/maple-ask <follow-up>
+/maple-end
+```
+
+Internally, `start` captures the Maple-backed Hermes `session_id`; `ask` resumes it with:
+
+```bash
+maple-agent --resume <session_id> "follow-up prompt"
+```
+
+Thread pointers are stored in:
+
+```text
+${HERMES_HOME:-~/.hermes}/maple/active-sessions.json
+```
+
+Current Hermes plugin command handlers receive raw args only, not platform chat/thread metadata. That means the `default` Maple thread is global to the Hermes home. In shared bot/group contexts, use `--name` to avoid collisions:
+
+```text
+/maple thread start --name project-a Review /path/to/file.md
+/maple thread ask --name project-a clarify the second recommendation
+/maple thread end --name project-a
+```
+
 ## Privacy boundary
 
 This integration is compartmentalization, not magic dust.
 
 - `/maple chat` and `/maple file` bypass the main Hermes model, but the gateway still receives the slash-command message.
 - `/maple file` is better than pasting sensitive text because chat contains a local path and instruction, not the whole document.
-- `/maple agent` is the strongest lane here because Maple is the actual Hermes model backend for that subprocess.
+- `/maple agent` is a one-shot lane where Maple is the actual Hermes model backend for that subprocess.
+- `/maple thread start/ask` is the multi-step version: it resumes the same Maple-backed Hermes session for follow-ups.
 - Do not process seed phrases, private keys, signing keys, or mnemonic backups through any LLM.
 
 ## Troubleshooting
