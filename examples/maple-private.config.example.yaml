@@ -1,0 +1,16 @@
+# Example Hermes config fragment for the optional maple-private profile.
+# Apply with `hermes --profile maple-private config set ...` rather than copying blindly.
+model:
+  provider: custom
+  default: kimi-k2-6
+  base_url: http://127.0.0.1:8787/v1
+  api_key: ${MAPLE_API_KEY}
+memory:
+  memory_enabled: false
+  user_profile_enabled: false
+privacy:
+  redact_pii: true
+platform_toolsets:
+  cli:
+    - file
+    - terminal

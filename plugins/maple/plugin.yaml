@@ -1,0 +1,10 @@
+name: maple
+version: 1.0.0
+description: "Maple Proxy integration for selected non-default LLM calls from Hermes."
+author: Community
+kind: standalone
+provides_tools:
+  - maple_health
+  - maple_models
+  - maple_chat
+  - maple_file
