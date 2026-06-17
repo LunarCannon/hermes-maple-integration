@@ -30,6 +30,8 @@ DEFAULT_BASE_URLS = [
 ]
 DEFAULT_MODEL = os.environ.get("MAPLE_MODEL", "kimi-k2-6")
 DEFAULT_TIMEOUT = float(os.environ.get("MAPLE_TIMEOUT", "300"))
+MAPLE_RESPONSE_BADGE = os.environ.get("MAPLE_RESPONSE_BADGE", "🍁 Maple").strip() or "🍁 Maple"
+MAPLE_RESPONSE_BADGE_ENABLED = os.environ.get("MAPLE_RESPONSE_BADGE_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 HIGH_RISK_RE = re.compile(
     r"(?i)\b(seed phrase|mnemonic|private key|xprv|zprv|yprv|wallet seed|signing key|api[_ -]?key|bearer\s+[A-Za-z0-9._-]{12,})\b"
 )
@@ -274,6 +276,15 @@ def _handle_maple_file(args: dict, **kw) -> str:
         return tool_error(f"Maple file failed: {e}")
 
 
+def _badge(title: str, body: str) -> str:
+    body = (body or "").strip()
+    if not MAPLE_RESPONSE_BADGE_ENABLED:
+        return body
+    title = (title or MAPLE_RESPONSE_BADGE).strip()
+    rule = "━" * min(max(len(title), 8), 32)
+    return f"{title}\n{rule}\n{body}" if body else f"{title}\n{rule}"
+
+
 def _json_or_text(handler, args: dict, *, text_key: str = "text") -> str:
     raw = handler(args)
     try:
@@ -291,15 +302,18 @@ def _format_status() -> str:
     try:
         data = _health_payload()
     except Exception as e:
-        return f"Maple: not healthy\n{e}"
+        return _badge("🍁 Maple status", f"not healthy\n{e}")
     service = data.get("service", {})
     health = data.get("health", {})
     return (
-        "Maple: healthy\n"
-        f"base_url: {data.get('base_url')}\n"
-        f"service: {service.get('active', 'unknown')}\n"
-        f"proxy: {health.get('service')} {health.get('version')} status={health.get('status')}\n"
-        f"default_model: {DEFAULT_MODEL}"
+        _badge(
+            "🍁 Maple status",
+            "healthy\n"
+            f"base_url: {data.get('base_url')}\n"
+            f"service: {service.get('active', 'unknown')}\n"
+            f"proxy: {health.get('service')} {health.get('version')} status={health.get('status')}\n"
+            f"default_model: {DEFAULT_MODEL}",
+        )
     )
 
 
@@ -307,8 +321,8 @@ def _format_models() -> str:
     try:
         data = _models_payload()
     except Exception as e:
-        return f"Maple models failed: {e}"
-    return "Maple models:\n" + "\n".join(f"- {m}" for m in data.get("models", []))
+        return _badge("🍁 Maple models", f"failed: {e}")
+    return _badge("🍁 Maple models", "\n".join(f"- {m}" for m in data.get("models", [])))
 
 
 def _split_file_args(raw: str) -> Dict[str, str]:
@@ -341,7 +355,8 @@ def _split_file_args(raw: str) -> Dict[str, str]:
 def _maple_slash(raw_args: str) -> str:
     raw = (raw_args or "").strip()
     if not raw or raw in {"help", "--help", "-h"}:
-        return (
+        return _badge(
+            "🍁 Maple commands",
             "Maple commands:\n"
             "/maple status\n"
             "/maple models\n"
@@ -362,8 +377,8 @@ def _maple_slash(raw_args: str) -> str:
         return _format_models()
     if sub == "chat":
         if not rest.strip():
-            return "Usage: /maple chat <non-sensitive prompt>"
-        return _json_or_text(_handle_maple_chat, {"prompt": rest.strip()})
+            return _badge("🍁 Maple", "Usage: /maple chat <non-sensitive prompt>")
+        return _badge("🍁 Maple", _json_or_text(_handle_maple_chat, {"prompt": rest.strip()}))
     if sub == "file":
         try:
             parsed = _split_file_args(rest)
@@ -372,9 +387,9 @@ def _maple_slash(raw_args: str) -> str:
                 args["output_path"] = parsed["output_path"]
             if parsed.get("model"):
                 args["model"] = parsed["model"]
-            return _json_or_text(_handle_maple_file, args)
+            return _badge("🍁 Maple file", _json_or_text(_handle_maple_file, args))
         except Exception as e:
-            return f"Maple file failed: {e}"
+            return _badge("🍁 Maple file", f"failed: {e}")
     if sub == "agent":
         return _run_maple_agent(rest.strip())
     if sub == "thread":
@@ -385,22 +400,22 @@ def _maple_slash(raw_args: str) -> str:
         return _thread_ask(rest.strip())
     if sub == "end":
         return _thread_end(rest.strip())
-    return f"Unknown /maple subcommand: {sub}\nTry /maple help"
+    return _badge("🍁 Maple", f"Unknown /maple subcommand: {sub}\nTry /maple help")
 
 
 def _run_maple_agent(raw: str) -> str:
     if not raw:
-        return "Usage: /maple agent <path-or-prompt>"
+        return _badge("🍁 Maple agent", "Usage: /maple agent <path-or-prompt>")
     try:
         argv = shlex.split(raw)
     except ValueError as e:
-        return f"maple-agent args parse failed: {e}"
+        return _badge("🍁 Maple agent", f"args parse failed: {e}")
     if not argv:
-        return "Usage: /maple agent <path-or-prompt>"
+        return _badge("🍁 Maple agent", "Usage: /maple agent <path-or-prompt>")
     rc, output = _run_maple_agent_argv(argv)
     if rc != 0:
-        return f"maple-agent failed ({rc}):\n{output[-2000:]}"
-    return _clean_agent_output(output) or "maple-agent completed with no output."
+        return _badge("🍁 Maple agent", f"failed ({rc}):\n{output[-2000:]}")
+    return _badge("🍁 Maple agent", _clean_agent_output(output) or "completed with no output.")
 
 
 def _maple_agent_wrapper() -> Path:
@@ -501,14 +516,14 @@ def _task_argv(raw_task: str) -> List[str]:
 def _thread_start(raw: str) -> str:
     name, task = _extract_name(raw)
     if not task:
-        return "Usage: /maple thread start [--name NAME] <task-or-file>"
+        return _badge("🍁 Maple thread", "Usage: /maple thread start [--name NAME] <task-or-file>")
     rc, output = _run_maple_agent_argv(_task_argv(task))
     clean = _clean_agent_output(output)
     if rc != 0:
-        return f"Maple thread start failed ({rc}):\n{output[-2000:]}"
+        return _badge(f"🍁 Maple thread: {name}", f"start failed ({rc}):\n{output[-2000:]}")
     session_id = _extract_session_id(output)
     if not session_id:
-        return "Maple thread start failed: no session_id returned.\n" + clean[-2000:]
+        return _badge(f"🍁 Maple thread: {name}", "start failed: no session_id returned.\n" + clean[-2000:])
     store = _thread_store_load()
     now = _now_iso()
     store[name] = {
@@ -518,68 +533,69 @@ def _thread_start(raw: str) -> str:
         "last_prompt": task[:500],
     }
     _thread_store_save(store)
-    return f"Started Maple thread `{name}` ({session_id}).\n\n{clean}".strip()
+    return _badge(f"🍁 Maple thread: {name}", f"Started ({session_id}).\n\n{clean}".strip())
 
 
 def _thread_ask(raw: str) -> str:
     name, prompt = _extract_name(raw)
     if not prompt:
-        return "Usage: /maple thread ask [--name NAME] <follow-up>"
+        return _badge("🍁 Maple thread", "Usage: /maple thread ask [--name NAME] <follow-up>")
     store = _thread_store_load()
     entry = store.get(name)
     if not entry:
-        return f"No active Maple thread `{name}`. Start one with: /maple thread start [--name {name}] <task>"
+        return _badge(f"🍁 Maple thread: {name}", f"No active thread. Start one with: /maple thread start --name {name} <task>")
     session_id = str(entry.get("session_id") or "")
     if not session_id:
-        return f"Maple thread `{name}` is missing a session_id. End it and start a new one."
+        return _badge(f"🍁 Maple thread: {name}", "Missing session_id. End it and start a new one.")
     rc, output = _run_maple_agent_argv(["--resume", session_id, prompt])
     clean = _clean_agent_output(output)
     if rc != 0:
-        return f"Maple thread ask failed ({rc}):\n{output[-2000:]}"
+        return _badge(f"🍁 Maple thread: {name}", f"ask failed ({rc}):\n{output[-2000:]}")
     new_session_id = _extract_session_id(output) or session_id
     entry.update({"session_id": new_session_id, "updated_at": _now_iso(), "last_prompt": prompt[:500]})
     store[name] = entry
     _thread_store_save(store)
-    return clean or "(empty Maple thread response)"
+    return _badge(f"🍁 Maple thread: {name}", clean or "(empty response)")
 
 
 def _thread_status(raw: str = "") -> str:
     name, _ = _extract_name(raw)
     store = _thread_store_load()
     if not store:
-        return "No active Maple threads. Start one with: /maple thread start <task>"
+        return _badge("🍁 Maple threads", "No active threads. Start one with: /maple thread start <task>")
     if name != "default" or raw.strip().startswith(("--name", "-n")):
         entry = store.get(name)
         if not entry:
-            return f"No active Maple thread `{name}`."
-        return (
-            f"Maple thread `{name}`\n"
+            return _badge(f"🍁 Maple thread: {name}", "No active thread.")
+        return _badge(
+            f"🍁 Maple thread: {name}",
             f"session_id: {entry.get('session_id')}\n"
             f"created_at: {entry.get('created_at')}\n"
             f"updated_at: {entry.get('updated_at')}\n"
             f"last_prompt: {entry.get('last_prompt', '')[:180]}"
         )
-    lines = ["Active Maple threads:"]
+    lines = []
     for key, entry in sorted(store.items()):
         lines.append(f"- {key}: {entry.get('session_id')} updated={entry.get('updated_at')}")
-    return "\n".join(lines)
+    return _badge("🍁 Maple threads", "\n".join(lines) or "No active threads.")
 
 
 def _thread_end(raw: str = "") -> str:
     name, _ = _extract_name(raw)
     store = _thread_store_load()
     if name not in store:
-        return f"No active Maple thread `{name}`."
+        return _badge(f"🍁 Maple thread: {name}", "No active thread.")
     sid = store[name].get("session_id")
     del store[name]
     _thread_store_save(store)
-    return f"Ended Maple thread `{name}` ({sid})."
+    return _badge(f"🍁 Maple thread: {name}", f"Ended ({sid}).")
 
 
 def _maple_thread_slash(raw: str) -> str:
     raw = (raw or "").strip()
     if not raw or raw in {"help", "--help", "-h"}:
-        return (
+        return _badge(
+            "🍁 Maple thread commands",
             "Maple thread commands:\n"
             "/maple thread start [--name NAME] <task-or-file>\n"
             "/maple thread ask [--name NAME] <follow-up>\n"
@@ -597,7 +613,7 @@ def _maple_thread_slash(raw: str) -> str:
         return _thread_status(rest.strip())
     if sub in {"end", "stop", "close", "clear"}:
         return _thread_end(rest.strip())
-    return f"Unknown /maple thread subcommand: {sub}\nTry /maple thread help"
+    return _badge("🍁 Maple thread", f"Unknown subcommand: {sub}\nTry /maple thread help")
 
 
 def register(ctx) -> None:
@@ -608,8 +624,8 @@ def register(ctx) -> None:
     ctx.register_command("maple", _maple_slash, description="Maple Proxy status, models, chat, file, agent, and stateful thread commands.", args_hint="status|models|chat|file|agent|thread ...")
     ctx.register_command("maple-status", lambda raw: _format_status(), description="Check Maple Proxy health.")
     ctx.register_command("maple-models", lambda raw: _format_models(), description="List Maple models.")
-    ctx.register_command("maple-chat", lambda raw: _json_or_text(_handle_maple_chat, {"prompt": raw.strip()}), description="Run a non-sensitive prompt through Maple/Kimi.", args_hint="<prompt>")
-    ctx.register_command("maple-file", lambda raw: _json_or_text(_handle_maple_file, _split_file_args(raw)), description="Run a local file through Maple/Kimi.", args_hint="<path> --prompt <instruction>")
+    ctx.register_command("maple-chat", lambda raw: _badge("🍁 Maple", _json_or_text(_handle_maple_chat, {"prompt": raw.strip()})), description="Run a non-sensitive prompt through Maple/Kimi.", args_hint="<prompt>")
+    ctx.register_command("maple-file", lambda raw: _badge("🍁 Maple file", _json_or_text(_handle_maple_file, _split_file_args(raw))), description="Run a local file through Maple/Kimi.", args_hint="<path> --prompt <instruction>")
     ctx.register_command("maple-agent", lambda raw: _run_maple_agent(raw.strip()), description="Spawn the maple-private Hermes profile via maple-agent.", args_hint="<path-or-prompt>")
     ctx.register_command("maple-thread", lambda raw: _maple_thread_slash(raw.strip()), description="Manage a resumable Maple-backed Hermes thread.", args_hint="start|ask|status|end ...")
     ctx.register_command("maple-start", lambda raw: _thread_start(raw.strip()), description="Start the default resumable Maple thread.", args_hint="<task>")

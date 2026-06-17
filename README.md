@@ -52,6 +52,16 @@ maple_chat
 maple_file
 ```
 
+Slash-command responses are visually labeled by default:
+
+```text
+🍁 Maple thread: project-a
+━━━━━━━━━━━━━━━━━━━━━━━━
+...
+```
+
+Set `MAPLE_RESPONSE_BADGE_ENABLED=0` to disable the label, or `MAPLE_RESPONSE_BADGE='Maple:'` to customize the default badge text.
+
 ## Prerequisites
 
 1. Hermes Agent installed and working.
