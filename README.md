@@ -276,6 +276,20 @@ The `maple-private` profile is sending the wrong or no key. Either:
 - set `MAPLE_API_KEY` in `${HERMES_HOME:-~/.hermes}/secrets/maple.env`, or
 - set a literal/test key in the profile only if you understand the storage tradeoff.
 
+### Raw protocol/UI noise before Maple answers
+
+The plugin defensively strips common junk before final text, including ANSI/spinner sequences, `session_id:` lines, resumed-session banners, leaked OpenAI/SSE `data:` frames, JSON completion envelopes, and leading `<think>...</think>`/reasoning blocks.
+
+The `maple-agent` wrapper also exports:
+
+```bash
+NO_COLOR=1
+CLICOLOR=0
+TERM=dumb
+```
+
+If your backend emits a new noise shape, capture a short redacted prefix and add it to the sanitizer patterns in `plugins/maple/__init__.py`.
+
 ## License
 
 MIT

@@ -40,6 +40,23 @@ MAPLE_STATE_DIR = HERMES_HOME / "maple"
 MAPLE_THREAD_STORE = Path(os.environ.get("MAPLE_THREAD_STORE", str(MAPLE_STATE_DIR / "active-sessions.json"))).expanduser()
 SESSION_ID_RE = re.compile(r"^session_id:\s*(\S+)\s*$", re.MULTILINE)
 RESUME_LINE_RE = re.compile(r"^↻ Resumed session .*$", re.MULTILINE)
+ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\][^\x07]*(?:\x07|\x1b\\)|\[[0-?]*[ -/]*[@-~])")
+CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+LEADING_THINK_BLOCK_RE = re.compile(r"(?is)^\s*<(think|thinking|analysis|reasoning)>.*?</\1>\s*")
+RAW_PREFIX_LINE_RE = re.compile(
+    r"(?i)^(?:"
+    r"session_id:\s*\S+|"
+    r"↻\s*Resumed\s+session\b.*|"
+    r"Hermes Agent\b.*|"
+    r"Using\s+model\b.*|"
+    r"Model:\s+.*|"
+    r"Provider:\s+.*|"
+    r"Toolsets?:\s+.*|"
+    r"(?:assistant|analysis|final|commentary)\s*:?|"
+    r"<\|[^|]+\|>|"
+    r"[-\\|/⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*(?:thinking|working|loading).*"
+    r")$"
+)
 
 
 class MaplePluginError(RuntimeError):
@@ -129,6 +146,94 @@ def _service_status() -> Dict[str, Any]:
         return {"available": False, "error": f"{type(e).__name__}: {e}"}
 
 
+
+def _extract_text_from_protocol_blob(text: str) -> str:
+    """Recover text if Maple/Hermes ever leaks raw OpenAI/SSE framing."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    # Full JSON response object, e.g. {"choices":[{"message":{"content":"..."}}]}
+    if raw.startswith("{"):
+        try:
+            obj = json.loads(raw)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            chunks: List[str] = []
+            for choice in obj.get("choices", []) or []:
+                if not isinstance(choice, dict):
+                    continue
+                msg = choice.get("message") or {}
+                delta = choice.get("delta") or {}
+                for source in (delta, msg):
+                    content = source.get("content") if isinstance(source, dict) else None
+                    if isinstance(content, str):
+                        chunks.append(content)
+                    elif isinstance(content, list):
+                        for part in content:
+                            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                                chunks.append(part["text"])
+            if chunks:
+                return "".join(chunks)
+
+    # Raw SSE, e.g. lines beginning data: {"choices":[{"delta":{"content":"..."}}]}
+    if "data:" in raw:
+        chunks: List[str] = []
+        saw_sse = False
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            saw_sse = True
+            payload = line[5:].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            for choice in event.get("choices", []) or []:
+                if not isinstance(choice, dict):
+                    continue
+                delta = choice.get("delta") or {}
+                msg = choice.get("message") or {}
+                for source in (delta, msg):
+                    content = source.get("content") if isinstance(source, dict) else None
+                    if isinstance(content, str):
+                        chunks.append(content)
+        if saw_sse and chunks:
+            return "".join(chunks)
+
+    return text or ""
+
+
+def _sanitize_maple_text(text: str) -> str:
+    """Strip transport/UI cruft that can occasionally precede Maple answers."""
+    text = _extract_text_from_protocol_blob(text or "")
+    text = ANSI_ESCAPE_RE.sub("", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = CONTROL_CHAR_RE.sub("", text)
+
+    # Remove leading model reasoning blocks if a backend leaks them before final text.
+    previous = None
+    while previous != text:
+        previous = text
+        text = LEADING_THINK_BLOCK_RE.sub("", text).lstrip()
+
+    lines = text.splitlines()
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and RAW_PREFIX_LINE_RE.match(lines[0].strip()):
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+
+    return "\n".join(lines).strip()
+
+
 def _health_payload(base_url: Optional[str] = None) -> Dict[str, Any]:
     base = _detect_base_url(base_url)
     health = _request_json("GET", _health_url(base), timeout=min(5.0, DEFAULT_TIMEOUT))
@@ -202,7 +307,7 @@ def _stream_chat(
         raise MaplePluginError(f"HTTP {e.code} from Maple chat: {raw[:1500]}") from e
     except urllib.error.URLError as e:
         raise MaplePluginError(f"could not reach Maple chat endpoint at {base}: {e.reason}") from e
-    text = "".join(chunks)
+    text = _sanitize_maple_text("".join(chunks))
     return {"success": True, "base_url": base, "model": model or DEFAULT_MODEL, "text": text}
 
 
@@ -211,6 +316,7 @@ def _write_optional_output(result: Dict[str, Any], output_path: Optional[str]) -
         return result
     path = Path(output_path).expanduser()
     path.parent.mkdir(parents=True, exist_ok=True)
+    result["text"] = _sanitize_maple_text(result.get("text", ""))
     path.write_text(result.get("text", ""), encoding="utf-8")
     result = dict(result)
     result["output_path"] = str(path)
@@ -294,7 +400,7 @@ def _json_or_text(handler, args: dict, *, text_key: str = "text") -> str:
     if not data.get("success"):
         return data.get("error") or data.get("message") or json.dumps(data, indent=2)
     if text_key in data:
-        return data[text_key] or "(empty Maple response)"
+        return _sanitize_maple_text(data[text_key]) or "(empty Maple response)"
     return json.dumps(data, indent=2, sort_keys=True)
 
 
@@ -444,7 +550,7 @@ def _run_maple_agent_argv(argv: List[str], timeout: int = 600) -> Tuple[int, str
 def _clean_agent_output(output: str) -> str:
     text = SESSION_ID_RE.sub("", output or "")
     text = RESUME_LINE_RE.sub("", text)
-    return "\n".join(line for line in text.splitlines() if line.strip()).strip()
+    return _sanitize_maple_text("\n".join(line for line in text.splitlines() if line.strip()))
 
 
 def _extract_session_id(output: str) -> str:

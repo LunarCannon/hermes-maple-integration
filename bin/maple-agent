@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Keep subprocess output machine-clean when called from gateway slash handlers.
+export NO_COLOR=1
+export CLICOLOR=0
+export TERM=dumb
+
 # Spawn a Hermes agent whose brain is Maple via the maple-private profile.
 # Supports one-shot prompts and --resume for stateful Maple thread follow-ups.
 # Sources the Maple key from the service env file without printing it.
