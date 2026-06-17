@@ -476,7 +476,10 @@ def _extract_name(raw: str) -> Tuple[str, str]:
         return "default", raw.strip()
     if len(parts) >= 2 and parts[0] in {"--name", "-n"}:
         name = _normalize_thread_name(parts[1])
-        rest = " ".join(shlex.quote(x) for x in parts[2:])
+        # Slash handlers receive one raw arg string. After consuming --name,
+        # treat the remaining tokens as a natural-language prompt unless the
+        # prompt intentionally starts with a wrapper flag like --file.
+        rest = " ".join(parts[2:]).strip()
         return name, rest
     return "default", (raw or "").strip()
 
